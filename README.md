@@ -13,9 +13,14 @@ Just solves the minor inconvenience of getting out of your flow/terminal to test
 
 ## Installation
 
-**Linux/macOS:**
+**Linux:**
 ```bash
 curl -sfL https://github.com/Mindgamesnl/mc/releases/latest/download/mc-linux-amd64 -o mc && chmod +x mc && sudo mv mc /usr/local/bin/
+```
+
+**macOS:**
+```
+curl -sfL https://github.com/Mindgamesnl/mc/releases/latest/download/mc-darwin-amd64 -o mc && chmod +x mc && sudo mv mc /usr/local/bin/
 ```
 
 **Windows PowerShell:**
