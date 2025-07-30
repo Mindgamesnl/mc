@@ -11,11 +11,15 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 )
 
 var Version = "dev" // Set by build flags
@@ -23,7 +27,6 @@ var Version = "dev" // Set by build flags
 type Config struct {
 	Version string `yaml:"version"`
 	Memory  string `yaml:"memory"`
-	Port    int    `yaml:"port"`
 }
 
 type item struct {
@@ -129,7 +132,6 @@ func main() {
 		config = &Config{
 			Version: version,
 			Memory:  "2G",
-			Port:    25565,
 		}
 
 		if err := saveConfig(config); err != nil {
@@ -357,11 +359,104 @@ func runServer(jarPath, memory string) error {
 	}
 
 	cmd := exec.Command("java", fmt.Sprintf("-Xmx%s", memory), "-jar", jarPath, "nogui")
-	cmd.Stdin = os.Stdin
+
+	// Set process group so we can kill the entire process tree
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+
+	// Create pipes for stdin to send commands
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdin pipe: %v", err)
+	}
+
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	return cmd.Run()
+	// Start the server
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start server: %v", err)
+	}
+
+	// Setup signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	shutdownInitiated := false
+	var shutdownMutex sync.Mutex
+
+	// Handle signals in a separate goroutine
+	go func() {
+		sigCount := 0
+		for range sigChan {
+			shutdownMutex.Lock()
+			sigCount++
+
+			go func() {
+				if sigCount == 1 && !shutdownInitiated {
+					shutdownInitiated = true
+					shutdownMutex.Unlock()
+
+					fmt.Println("\n🛑 Shutting down server gracefully... (Press Ctrl+C again to force quit)")
+
+					// Send stop command to the server
+					go func() {
+						_, err := stdin.Write([]byte("stop\n"))
+						if err != nil {
+							fmt.Printf("Failed to send stop command: %v\n", err)
+						}
+					}()
+
+					// Wait for graceful shutdown with a shorter timeout
+					done := make(chan error, 1)
+					go func() {
+						done <- cmd.Wait()
+					}()
+
+					select {
+					case err := <-done:
+						if err != nil {
+							fmt.Printf("Server exited with error: %v\n", err)
+						} else {
+							fmt.Println("✅ Server shut down gracefully")
+						}
+						os.Exit(0)
+					case <-time.After(5 * time.Second):
+						fmt.Println("⏱️ Graceful shutdown timeout, forcing termination...")
+						killProcessGroup(cmd.Process.Pid)
+						os.Exit(1)
+					}
+				} else {
+					shutdownMutex.Unlock()
+					// Second Ctrl+C or any subsequent signals - force kill immediately
+					fmt.Println("\n💀 Force killing server...")
+					killProcessGroup(cmd.Process.Pid)
+					os.Exit(1)
+				}
+			}()
+		}
+	}()
+
+	// Wait for the process to complete
+	err = cmd.Wait()
+	shutdownMutex.Lock()
+	defer shutdownMutex.Unlock()
+
+	if err != nil && !shutdownInitiated {
+		return fmt.Errorf("server process failed: %v", err)
+	}
+
+	return nil
+}
+
+// killProcessGroup kills the process and all its children
+func killProcessGroup(pid int) {
+	// Kill the entire process group
+	syscall.Kill(-pid, syscall.SIGKILL)
+
+	// Also try to kill the specific process as fallback
+	syscall.Kill(pid, syscall.SIGKILL)
 }
 
 func acceptEula() error {

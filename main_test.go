@@ -51,7 +51,7 @@ func TestCompareVersions(t *testing.T) {
 
 func TestExtractLatestBuild(t *testing.T) {
 	t.Log("Testing build number extraction from JSON...")
-	
+
 	t.Log("Testing with valid builds JSON")
 	jsonBody := `{"builds":[{"build":123},{"build":124},{"build":125}]}`
 	result := extractLatestBuild(jsonBody)
@@ -71,7 +71,7 @@ func TestExtractLatestBuild(t *testing.T) {
 	} else {
 		t.Log("✓ Empty builds handled correctly")
 	}
-	
+
 	t.Log("Testing with malformed JSON")
 	malformedBody := `{"builds":[{"build":"not-a-number"}]}`
 	result = extractLatestBuild(malformedBody)
@@ -84,7 +84,7 @@ func TestExtractLatestBuild(t *testing.T) {
 
 func TestLoadConfigNotExists(t *testing.T) {
 	t.Log("Testing config loading when file doesn't exist...")
-	
+
 	// Ensure no mc.yml exists in current directory
 	originalExists := false
 	if _, err := os.Stat("mc.yml"); err == nil {
@@ -92,7 +92,7 @@ func TestLoadConfigNotExists(t *testing.T) {
 		os.Rename("mc.yml", "mc.yml.backup")
 		defer os.Rename("mc.yml.backup", "mc.yml")
 	}
-	
+
 	config, exists, err := loadConfig()
 	if err != nil {
 		t.Errorf("loadConfig() error = %v, want nil", err)
@@ -103,7 +103,7 @@ func TestLoadConfigNotExists(t *testing.T) {
 	if config != nil {
 		t.Errorf("loadConfig() config = %v, want nil", config)
 	}
-	
+
 	if !originalExists {
 		t.Log("✓ Non-existent config file handled correctly")
 	}
@@ -111,7 +111,7 @@ func TestLoadConfigNotExists(t *testing.T) {
 
 func TestSaveAndLoadConfig(t *testing.T) {
 	t.Log("Testing config save and load operations...")
-	
+
 	tmpFile := "test_mc.yml"
 	defer os.Remove(tmpFile)
 
@@ -131,10 +131,9 @@ func TestSaveAndLoadConfig(t *testing.T) {
 	config := &Config{
 		Version: "1.21.4",
 		Memory:  "4G",
-		Port:    25565,
 	}
-	
-	t.Logf("Saving config: Version=%s, Memory=%s, Port=%d", config.Version, config.Memory, config.Port)
+
+	t.Logf("Saving config: Version=%s, Memory=%s", config.Version, config.Memory)
 
 	err := saveConfig(config)
 	if err != nil {
@@ -152,54 +151,51 @@ func TestSaveAndLoadConfig(t *testing.T) {
 		t.Errorf("loadConfig() exists = %v, want true", exists)
 		return
 	}
-	
-	t.Logf("Loaded config: Version=%s, Memory=%s, Port=%d", loadedConfig.Version, loadedConfig.Memory, loadedConfig.Port)
-	
+
+	t.Logf("Loaded config: Version=%s, Memory=%s", loadedConfig.Version, loadedConfig.Memory)
+
 	if loadedConfig.Version != config.Version {
 		t.Errorf("loadConfig() version = %s, want %s", loadedConfig.Version, config.Version)
 	}
 	if loadedConfig.Memory != config.Memory {
 		t.Errorf("loadConfig() memory = %s, want %s", loadedConfig.Memory, config.Memory)
 	}
-	if loadedConfig.Port != config.Port {
-		t.Errorf("loadConfig() port = %d, want %d", loadedConfig.Port, config.Port)
-	}
-	
+
 	t.Log("✓ Config round-trip successful")
 }
 
 func TestAcceptEula(t *testing.T) {
 	t.Log("Testing EULA acceptance...")
-	
+
 	// Clean up any existing eula.txt
 	defer os.Remove("eula.txt")
-	
+
 	err := acceptEula()
 	if err != nil {
 		t.Errorf("acceptEula() error = %v, want nil", err)
 		return
 	}
-	
+
 	// Check if file was created
 	content, err := os.ReadFile("eula.txt")
 	if err != nil {
 		t.Errorf("Failed to read eula.txt: %v", err)
 		return
 	}
-	
+
 	contentStr := string(content)
 	if !contains(contentStr, "eula=true") {
 		t.Errorf("eula.txt doesn't contain 'eula=true', got: %s", contentStr)
 		return
 	}
-	
+
 	t.Log("✓ EULA file created with correct content")
 }
 
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 || 
-		(len(s) > len(substr) && (s[:len(substr)] == substr || s[len(s)-len(substr):] == substr || 
-		containsInMiddle(s, substr))))
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > len(substr) && (s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
+			containsInMiddle(s, substr))))
 }
 
 func containsInMiddle(s, substr string) bool {

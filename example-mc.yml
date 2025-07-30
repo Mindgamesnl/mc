@@ -3,10 +3,8 @@
 
 version: "1.21.4"  # Minecraft version to use
 memory: "2G"       # RAM allocation for the server (e.g., "1G", "4G", "512M")
-port: 25565        # Server port (default Minecraft port)
 
 # Notes:
 # - The version will be updated when you run 'mc <different-version>'
 # - Memory can be specified in gigabytes (G) or megabytes (M)
-# - Port 25565 is the standard Minecraft port, change if needed
 # - This file is created in your current working directory
