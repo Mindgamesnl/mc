@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,11 +12,15 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 )
 
 var Version = "dev" // Set by build flags
@@ -82,14 +87,22 @@ func (m model) View() string {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "test" {
-		testJavaSetup()
+	// Lightweight args parsing to support new flags while keeping old behavior.
+	tempMode, offlineMode, positional, handled := parseArgs(os.Args[1:])
+	if handled { // version/test already handled
 		return
 	}
 
-	if len(os.Args) > 1 && (os.Args[1] == "version" || os.Args[1] == "--version" || os.Args[1] == "-v") {
-		fmt.Printf("mc version %s\n", Version)
-		return
+	// Optional: change to temp working directory
+	var cleanup func()
+	if tempMode {
+		var err error
+		cleanup, err = useTempWorkdir()
+		if err != nil {
+			fmt.Printf("Error creating temp workdir: %v\n", err)
+			os.Exit(1)
+		}
+		defer cleanup()
 	}
 
 	if err := validateJava(); err != nil {
@@ -104,8 +117,8 @@ func main() {
 	}
 
 	var version string
-	if len(os.Args) > 1 {
-		version = os.Args[1]
+	if len(positional) > 0 {
+		version = positional[0]
 	}
 
 	if !exists && version == "" {
@@ -158,11 +171,68 @@ func main() {
 		}
 	}
 
+	// Prepare server.properties based on flags (offline mode and port)
+	if offlineMode {
+		if err := setServerProperty("online-mode", "false"); err != nil {
+			fmt.Printf("Warning: failed to set online-mode=false: %v\n", err)
+		}
+	}
+	if config != nil && config.Port != 0 {
+		if err := setServerProperty("server-port", strconv.Itoa(config.Port)); err != nil {
+			fmt.Printf("Warning: failed to set server-port: %v\n", err)
+		}
+	}
+
 	fmt.Printf("Starting Minecraft server %s...\n", config.Version)
 	if err := runServer(jarPath, config.Memory); err != nil {
 		fmt.Printf("Error running server: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// parseArgs parses flags: --temp, --offline/--offlinemode, and preserves positional args (like version).
+// It also handles legacy commands: "test" and app version flags.
+func parseArgs(args []string) (tempMode bool, offlineMode bool, positionals []string, handled bool) {
+	for _, a := range args {
+		switch a {
+		case "test":
+			testJavaSetup()
+			return false, false, nil, true
+		case "version", "--version", "-v":
+			fmt.Printf("mc version %s\n", Version)
+			return false, false, nil, true
+		case "--temp":
+			tempMode = true
+		case "--offline", "--offlinemode":
+			offlineMode = true
+		default:
+			if strings.HasPrefix(a, "-") {
+				// Unknown flag, ignore for now to keep behavior simple
+				continue
+			}
+			positionals = append(positionals, a)
+		}
+	}
+	return
+}
+
+// useTempWorkdir creates a temporary directory under /tmp and chdirs into it. Returns a cleanup function.
+func useTempWorkdir() (func(), error) {
+	tmpDir, err := os.MkdirTemp("/tmp", "mc-*")
+	if err != nil {
+		return nil, err
+	}
+	cwd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		return nil, err
+	}
+	cleanup := func() {
+		// best-effort: go back and remove temp dir
+		_ = os.Chdir(cwd)
+		_ = os.RemoveAll(tmpDir)
+	}
+	fmt.Printf("Using temporary workdir: %s\n", tmpDir)
+	return cleanup, nil
 }
 
 func validateJava() error {
@@ -350,18 +420,150 @@ func extractLatestBuild(jsonBody string) string {
 	return ""
 }
 
+// setServerProperty ensures server.properties exists with a given key=value, updating if already present.
+func setServerProperty(key, value string) error {
+	const propsFile = "server.properties"
+	var lines []string
+	if b, err := os.ReadFile(propsFile); err == nil {
+		// load existing
+		lines = strings.Split(string(b), "\n")
+	} else if os.IsNotExist(err) {
+		lines = []string{}
+	} else if err != nil {
+		return err
+	}
+
+	// find and update or append
+	found := false
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, key+"=") || strings.HasPrefix(ln, "#"+key+"=") {
+			lines[i] = fmt.Sprintf("%s=%s", key, value)
+			found = true
+			break
+		}
+	}
+	if !found {
+		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	content := strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
+	return os.WriteFile(propsFile, []byte(content), 0644)
+}
+
+type lockedWriteCloser struct {
+	w  io.WriteCloser
+	mu sync.Mutex
+}
+
+func (l *lockedWriteCloser) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+func (l *lockedWriteCloser) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Close()
+}
+
 func runServer(jarPath, memory string) error {
 	// Auto-accept EULA
 	if err := acceptEula(); err != nil {
 		return fmt.Errorf("failed to accept EULA: %v", err)
 	}
 
-	cmd := exec.Command("java", fmt.Sprintf("-Xmx%s", memory), "-jar", jarPath, "nogui")
-	cmd.Stdin = os.Stdin
+	// Build command with signal-aware handling and truly transparent stdio proxying
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "java", fmt.Sprintf("-Xmx%s", memory), "-jar", jarPath, "nogui")
+
+	// Place the child in its own process group so we can signal it (and its children) reliably
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Wire stdout/stderr directly
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	return cmd.Run()
+	// We need a pipe for stdin, so we can both forward user's input and inject "stop" if needed
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdin := &lockedWriteCloser{w: stdinPipe}
+
+	// Forward user's keystrokes to server stdin via the locked writer
+	userInputDone := make(chan struct{})
+	go func() {
+		defer close(userInputDone)
+		_, _ = io.Copy(stdin, os.Stdin)
+		// When user's stdin closes (e.g., ctrl-d), close child's stdin to signal EOF
+		_ = stdin.Close()
+	}()
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	// Signal handling: gracefully stop, then escalate
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	stopping := false
+	interrupts := 0
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	escalateOnce := make(chan struct{}, 1)
+	escalateOnce <- struct{}{}
+
+	for {
+		select {
+		case err := <-done:
+			// Child finished
+			return err
+		case sig := <-sigCh:
+			interrupts++
+			if !stopping {
+				stopping = true
+				// First signal: try graceful stop via console command
+				_, _ = stdin.Write([]byte("stop\n"))
+				// After grace period, escalate only once
+				select {
+				case <-escalateOnce:
+					go func(pid int) {
+						t := time.NewTimer(10 * time.Second)
+						<-t.C
+						_ = syscall.Kill(-pid, syscall.SIGTERM)
+						t2 := time.NewTimer(5 * time.Second)
+						<-t2.C
+						_ = syscall.Kill(-pid, syscall.SIGKILL)
+					}(cmd.Process.Pid)
+				default:
+				}
+				continue
+			}
+			// Already stopping: forward the signal to the child process group immediately
+			_ = syscall.Kill(-cmd.Process.Pid, signalToSys(sig))
+			if interrupts >= 3 {
+				// Hard kill on repeated interrupts
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+		}
+	}
+}
+
+func signalToSys(sig os.Signal) syscall.Signal {
+	switch sig {
+	case os.Interrupt:
+		return syscall.SIGINT
+	case syscall.SIGTERM:
+		return syscall.SIGTERM
+	default:
+		return syscall.SIGINT
+	}
 }
 
 func acceptEula() error {
