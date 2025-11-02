@@ -77,6 +77,9 @@ jobs:
         id: get_version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
+      - name: Clean artifacts directory
+        run: rm -rf ./artifacts
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:

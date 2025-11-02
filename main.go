@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -479,8 +478,8 @@ func runServer(jarPath, memory string) error {
 
 	cmd := exec.CommandContext(ctx, "java", fmt.Sprintf("-Xmx%s", memory), "-jar", jarPath, "nogui")
 
-	// Place the child in its own process group so we can signal it (and its children) reliably
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Place the child in its own process group (POSIX) or leave default on Windows
+	setCmdSysProcAttr(cmd)
 
 	// Wire stdout/stderr directly
 	cmd.Stdout = os.Stdout
@@ -508,7 +507,8 @@ func runServer(jarPath, memory string) error {
 
 	// Signal handling: gracefully stop, then escalate
 	sigCh := make(chan os.Signal, 4)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	// Listen for interrupts and termination signals (SIGTERM on POSIX)
+	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
 
 	stopping := false
@@ -533,36 +533,22 @@ func runServer(jarPath, memory string) error {
 				// After grace period, escalate only once
 				select {
 				case <-escalateOnce:
-					go func(pid int) {
+					go func() {
 						t := time.NewTimer(10 * time.Second)
 						<-t.C
-						_ = syscall.Kill(-pid, syscall.SIGTERM)
-						t2 := time.NewTimer(5 * time.Second)
-						<-t2.C
-						_ = syscall.Kill(-pid, syscall.SIGKILL)
-					}(cmd.Process.Pid)
+						escalateTerminate(cmd)
+					}()
 				default:
 				}
 				continue
 			}
-			// Already stopping: forward the signal to the child process group immediately
-			_ = syscall.Kill(-cmd.Process.Pid, signalToSys(sig))
+			// Already stopping: forward the signal to the child
+			forwardSignal(cmd, sig)
 			if interrupts >= 3 {
 				// Hard kill on repeated interrupts
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				forceKill(cmd)
 			}
 		}
-	}
-}
-
-func signalToSys(sig os.Signal) syscall.Signal {
-	switch sig {
-	case os.Interrupt:
-		return syscall.SIGINT
-	case syscall.SIGTERM:
-		return syscall.SIGTERM
-	default:
-		return syscall.SIGINT
 	}
 }
 
