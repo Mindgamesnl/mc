@@ -60,7 +60,7 @@ jobs:
           go build -a -installsuffix cgo -ldflags="-w -s -X main.Version=${{ steps.get_version.outputs.version }}" -o ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
           path: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
