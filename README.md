@@ -86,3 +86,6 @@ git clone https://github.com/Mindgamesnl/mc.git
 cd mc
 go build -o mc
 ```
+
+# Honourable mention
+To _Dr. Duco LeKuuk_ for complaining about how annoying it is to create temp servers, despite literally having the tool installed
