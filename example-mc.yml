@@ -1,12 +1,16 @@
 # Example mc.yml configuration file
 # This file is automatically created when you run 'mc <version>' for the first time
 
-version: "1.21.4"  # Minecraft version to use
+version: "26.2"    # Minecraft version to use
 memory: "2G"       # RAM allocation for the server (e.g., "1G", "4G", "512M")
 port: 25565        # Server port (default Minecraft port)
 
 # Notes:
-# - The version will be updated when you run 'mc <different-version>'
+# - Versions may use the current scheme ("26.2", "26.2.1"), the legacy scheme
+#   ("1.21.4", "1.8.8"), or a pre-release ("26.2-rc-2", "1.21.11-rc3").
+#   Run 'mc versions' to see everything PaperMC currently publishes.
+# - Running 'mc <different-version>' updates only the version field, so the
+#   memory and port settings below are preserved.
 # - Memory can be specified in gigabytes (G) or megabytes (M)
 # - Port 25565 is the standard Minecraft port, change if needed
 # - This file is created in your current working directory

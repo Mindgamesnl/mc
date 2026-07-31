@@ -4,7 +4,10 @@ BINARY_NAME=mc
 VERSION?=dev
 LDFLAGS=-ldflags="-w -s -X main.Version=$(VERSION)"
 
-.PHONY: build test clean install release-local help
+PLATFORMS=linux-amd64 linux-arm64 windows-amd64.exe darwin-amd64 darwin-arm64
+
+.PHONY: help build test test-coverage lint vet fmt fmt-check clean install \
+        release-local checksums deps mod-tidy dev-setup all
 
 help: ## Show this help message
 	@echo "Available commands:"
@@ -13,46 +16,56 @@ help: ## Show this help message
 build: ## Build the binary
 	go build $(LDFLAGS) -o $(BINARY_NAME)
 
-test: ## Run tests with verbose output
-	go test -v -race -coverprofile=coverage.out
+test: ## Run tests with the race detector and coverage
+	go test -v -race -coverprofile=coverage.out ./...
 
-test-coverage: test ## Run tests and show coverage
+test-coverage: test ## Run tests and open the coverage report
 	go tool cover -html=coverage.out
 
-clean: ## Clean build artifacts
+vet: ## Run go vet
+	go vet ./...
+
+fmt: ## Format Go code
+	go fmt ./...
+
+fmt-check: ## Fail if any file is not gofmt-clean
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+		echo "These files need gofmt:"; echo "$$unformatted"; exit 1; \
+	fi
+
+lint: fmt-check vet ## Run formatting and vet checks
+
+clean: ## Clean build artifacts and generated server files
 	go clean
-	rm -f $(BINARY_NAME)
-	rm -f coverage.out
-	rm -f mc-*
-	rm -f *.jar
-	rm -f mc.yml
-	rm -f eula.txt
+	rm -f $(BINARY_NAME) $(BINARY_NAME)-* coverage.out checksums.txt
+	rm -f *.jar mc.yml eula.txt server.properties
 
 install: build ## Install binary to /usr/local/bin
-	sudo mv $(BINARY_NAME) /usr/local/bin/
+	sudo install -m 0755 $(BINARY_NAME) /usr/local/bin/$(BINARY_NAME)
 
 release-local: ## Build release binaries locally
 	@echo "Building release binaries..."
-	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BINARY_NAME)-linux-amd64
-	GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o $(BINARY_NAME)-windows-amd64.exe
-	GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o $(BINARY_NAME)-darwin-amd64
-	GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o $(BINARY_NAME)-darwin-arm64
+	@for platform in $(PLATFORMS); do \
+		goos=$${platform%%-*}; \
+		rest=$${platform#*-}; \
+		goarch=$${rest%.exe}; \
+		echo "  $$goos/$$goarch"; \
+		GOOS=$$goos GOARCH=$$goarch CGO_ENABLED=0 \
+			go build $(LDFLAGS) -o $(BINARY_NAME)-$$platform || exit 1; \
+	done
 	@echo "Release binaries built:"
 	@ls -la $(BINARY_NAME)-*
 
 checksums: release-local ## Generate checksums for release binaries
 	sha256sum $(BINARY_NAME)-* > checksums.txt
-	@echo "Checksums generated:"
 	@cat checksums.txt
 
 deps: ## Download and verify dependencies
 	go mod download
 	go mod verify
 
-fmt: ## Format Go code
-	go fmt ./...
-
-mod-tidy: ## Tidy and verify the go.mod file
+mod-tidy: ## Tidy and verify go.mod
 	go mod tidy
 	go mod verify
 

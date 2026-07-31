@@ -6,12 +6,12 @@ on:
   pull_request:
     branches: [ main ]
 
+env:
+  GO_VERSION: '1.25.x'
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        go-version: ['1.24.5']
 
     steps:
     - uses: actions/checkout@v4
@@ -19,15 +19,8 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: ${{ matrix.go-version }}
-
-    - name: Cache Go modules
-      uses: actions/cache@v4
-      with:
-        path: ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go-
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
 
     - name: Download dependencies
       run: go mod download
@@ -35,18 +28,27 @@ jobs:
     - name: Verify dependencies
       run: go mod verify
 
+    - name: Check formatting
+      run: |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "These files need gofmt:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    - name: Run go vet
+      run: go vet ./...
+
     - name: Run tests
-      run: go test -v -race -coverprofile=coverage.out
+      run: go test -v -race -coverprofile=coverage.out ./...
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v5
       with:
-        file: ./coverage.out
+        files: ./coverage.out
         flags: unittests
         name: codecov-umbrella
-
-    - name: Run go vet
-      run: go vet ./...
 
   test-build:
     runs-on: ubuntu-latest
@@ -58,19 +60,24 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.24.5'
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
 
     - name: Build for multiple platforms
       run: |
-        GOOS=linux GOARCH=amd64 go build -o mc-linux-amd64
-        GOOS=windows GOARCH=amd64 go build -o mc-windows-amd64.exe
-        GOOS=darwin GOARCH=amd64 go build -o mc-darwin-amd64
-        GOOS=darwin GOARCH=arm64 go build -o mc-darwin-arm64
-
-    - name: Test binaries
-      run: |
-        ./mc-linux-amd64 test || echo "Java not available in CI, expected failure"
+        set -e
+        for platform in linux-amd64 linux-arm64 windows-amd64.exe darwin-amd64 darwin-arm64; do
+          goos=${platform%%-*}
+          rest=${platform#*-}
+          goarch=${rest%.exe}
+          GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 go build -o "mc-$platform"
+        done
         file mc-*
+
+    - name: Smoke-test the native binary
+      run: |
+        ./mc-linux-amd64 --version
+        ./mc-linux-amd64 --help
 
   integration-test:
     runs-on: ubuntu-latest
@@ -82,13 +89,14 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.24.5'
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
 
     - name: Set up Java
       uses: actions/setup-java@v4
       with:
         distribution: 'temurin'
-        java-version: '17'
+        java-version: '21'
 
     - name: Build
       run: go build -o mc
@@ -96,10 +104,16 @@ jobs:
     - name: Test Java validation
       run: ./mc test
 
-    - name: Test config creation
+    - name: List versions from the PaperMC API
       run: |
-        mkdir test-dir
-        cd test-dir
-        echo "1.21.4" | ../mc || true  # May fail due to network or Paper API
-        test -f mc.yml && echo "✓ Config file created" || echo "⚠ Config test skipped"
-        test -f eula.txt && echo "✓ EULA file created" || echo "⚠ EULA test skipped"
+        # Exercises the live fill.papermc.io v3 API; v2 was retired (HTTP 410).
+        ./mc versions | tee versions.txt
+        grep -q "Available Paper versions" versions.txt
+
+    - name: Reject an unpublished version
+      run: |
+        mkdir -p unknown-version && cd unknown-version
+        if ../mc 99.99.99 < /dev/null; then
+          echo "expected a failure for an unpublished version"
+          exit 1
+        fi

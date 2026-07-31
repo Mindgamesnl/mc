@@ -6,6 +6,7 @@ on:
 
 env:
   BINARY_NAME: mc
+  GO_VERSION: '1.25.x'
 
 jobs:
   build-and-upload:
@@ -18,6 +19,9 @@ jobs:
           - goos: linux
             goarch: amd64
             suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
           - goos: windows
             goarch: amd64
             suffix: windows-amd64.exe
@@ -34,15 +38,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24.5'
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
 
       - name: Get version from tag
         id: get_version
@@ -57,7 +54,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
-          go build -a -installsuffix cgo -ldflags="-w -s -X main.Version=${{ steps.get_version.outputs.version }}" -o ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
+          go build -trimpath -ldflags="-w -s -X main.Version=${{ steps.get_version.outputs.version }}" -o ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -107,42 +104,52 @@ jobs:
       - name: Update release notes with checksums
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
         run: |
-          # Get current release notes
-          CURRENT_NOTES=$(gh release view ${{ github.event.release.tag_name }} --json body --jq '.body')
-          
-          # Append installation instructions and checksums if not already present
-          if ! echo "$CURRENT_NOTES" | grep -q "### Installation"; then
-            cat > additional_notes.md << 'EOF'
-          
+          set -euo pipefail
+
+          CURRENT_NOTES=$(gh release view "$TAG" --json body --jq '.body')
+
+          # Nothing to do if a previous run already appended this section.
+          if echo "$CURRENT_NOTES" | grep -q "### Installation"; then
+            echo "Release notes already contain installation instructions."
+            exit 0
+          fi
+
+          BASE="https://github.com/$REPO/releases/download/$TAG"
+
+          # The heredoc is quoted so the markdown backticks are taken
+          # literally; the checksums are appended afterwards instead of being
+          # substituted inside it.
+          {
+            printf '%s\n' "$CURRENT_NOTES"
+            cat << 'EOF'
+
           ### Installation
-          
+
           **Linux/macOS (one-liner):**
           ```bash
-          curl -sfL https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/mc-linux-amd64 -o mc && chmod +x mc && sudo mv mc /usr/local/bin/
+          curl -sfL BASE_URL/mc-linux-amd64 -o mc && chmod +x mc && sudo mv mc /usr/local/bin/
           ```
-          
+
           **Windows (PowerShell):**
           ```powershell
-          Invoke-WebRequest -Uri "https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/mc-windows-amd64.exe" -OutFile "mc.exe"
+          Invoke-WebRequest -Uri "BASE_URL/mc-windows-amd64.exe" -OutFile "mc.exe"
           ```
-          
+
           ### Manual Downloads
-          - **Linux (x64):** [mc-linux-amd64](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/mc-linux-amd64)
-          - **Windows (x64):** [mc-windows-amd64.exe](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/mc-windows-amd64.exe)
-          - **macOS (Intel):** [mc-darwin-amd64](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/mc-darwin-amd64)
-          - **macOS (Apple Silicon):** [mc-darwin-arm64](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/mc-darwin-arm64)
-          
+          - **Linux (x64):** [mc-linux-amd64](BASE_URL/mc-linux-amd64)
+          - **Linux (ARM64):** [mc-linux-arm64](BASE_URL/mc-linux-arm64)
+          - **Windows (x64):** [mc-windows-amd64.exe](BASE_URL/mc-windows-amd64.exe)
+          - **macOS (Intel):** [mc-darwin-amd64](BASE_URL/mc-darwin-amd64)
+          - **macOS (Apple Silicon):** [mc-darwin-arm64](BASE_URL/mc-darwin-arm64)
+
           ## Checksums (SHA256)
           ```
-          $(cat release/checksums.txt)
-          ```
           EOF
-          
-            # Combine current notes with additional notes
-            echo "$CURRENT_NOTES" > combined_notes.md
-            cat additional_notes.md >> combined_notes.md
-          
-            # Update the release with the combined notes
-            gh release edit ${{ github.event.release.tag_name }} --notes-file combined_notes.md
-          fi
+            cat release/checksums.txt
+            printf '```\n'
+          } | sed "s|BASE_URL|$BASE|g" > combined_notes.md
+
+          gh release edit "$TAG" --notes-file combined_notes.md

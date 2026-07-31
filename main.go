@@ -2,581 +2,185 @@ package main
 
 import (
 	"bufio"
-	"context"
+	"errors"
 	"fmt"
-	"github.com/charmbracelet/bubbles/list"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"gopkg.in/yaml.v3"
 	"io"
-	"net/http"
 	"os"
-	"os/exec"
-	"os/signal"
-	"path/filepath"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
-var Version = "dev" // Set by build flags
-
-type Config struct {
-	Version string `yaml:"version"`
-	Memory  string `yaml:"memory"`
-	Port    int    `yaml:"port"`
-}
-
-type item struct {
-	title string
-	desc  string
-}
-
-func (i item) FilterValue() string { return i.title }
-func (i item) Title() string       { return i.title }
-func (i item) Description() string { return i.desc }
-
-type model struct {
-	list     list.Model
-	choice   string
-	quitting bool
-}
-
-func (m model) Init() tea.Cmd {
-	return nil
-}
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.list.SetWidth(msg.Width)
-		return m, nil
-
-	case tea.KeyMsg:
-		switch keypress := msg.String(); keypress {
-		case "ctrl+c", "q":
-			m.quitting = true
-			return m, tea.Quit
-
-		case "enter":
-			i, ok := m.list.SelectedItem().(item)
-			if ok {
-				m.choice = i.title
-			}
-			return m, tea.Quit
-		}
-	}
-
-	var cmd tea.Cmd
-	m.list, cmd = m.list.Update(msg)
-	return m, cmd
-}
-
-func (m model) View() string {
-	if m.choice != "" {
-		return ""
-	}
-	if m.quitting {
-		return "Bye!\n"
-	}
-	return "\n" + m.list.View()
-}
+// Version is set at build time via -ldflags "-X main.Version=...".
+var Version = "dev"
 
 func main() {
-	// Lightweight args parsing to support new flags while keeping old behavior.
-	tempMode, offlineMode, positional, handled := parseArgs(os.Args[1:])
-	if handled { // version/test already handled
-		return
+	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, errAborted) {
+			os.Exit(130)
+		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	opts, err := parseArgs(args)
+	if err != nil {
+		return fmt.Errorf("%w\nRun `mc --help` for usage", err)
 	}
 
-	// Optional: change to temp working directory
-	var cleanup func()
-	if tempMode {
-		var err error
-		cleanup, err = useTempWorkdir()
+	switch opts.cmd {
+	case cmdHelp:
+		printUsage(os.Stdout)
+		return nil
+	case cmdVersion:
+		fmt.Printf("mc version %s\n", Version)
+		return nil
+	case cmdTest:
+		return testJavaSetup()
+	case cmdVersions:
+		return printAvailableVersions(os.Stdout)
+	}
+
+	if opts.temp {
+		cleanup, err := useTempWorkdir()
 		if err != nil {
-			fmt.Printf("Error creating temp workdir: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("creating temp workdir: %w", err)
 		}
 		defer cleanup()
 	}
 
 	if err := validateJava(); err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
+	config, err := resolveConfig(opts)
+	if err != nil {
+		return err
+	}
+
+	jarPath := fmt.Sprintf("paper-%s.jar", config.Version)
+	if _, err := os.Stat(jarPath); errors.Is(err, os.ErrNotExist) {
+		if err := downloadPaper(config.Version, jarPath); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+
+	if opts.offline {
+		if err := setServerProperty("online-mode", "false"); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to set online-mode=false: %v\n", err)
+		}
+	}
+	if err := setServerProperty("server-port", strconv.Itoa(config.Port)); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to set server-port: %v\n", err)
+	}
+
+	fmt.Printf("Starting Minecraft server %s...\n", config.Version)
+	return runServer(jarPath, config.Memory)
+}
+
+// resolveConfig decides which version to run, creating or updating mc.yml as
+// needed. An explicit version argument wins; otherwise an existing config is
+// used, with a picker when several versions are already downloaded.
+func resolveConfig(opts options) (*Config, error) {
 	config, exists, err := loadConfig()
 	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
-		os.Exit(1)
+		return nil, err
 	}
 
-	var version string
-	if len(positional) > 0 {
-		version = positional[0]
-	}
-
+	version := opts.mcVersion
 	if !exists && version == "" {
-		fmt.Print("No mc.yml found. Enter Minecraft version (e.g., 1.21.4): ")
-		scanner := bufio.NewScanner(os.Stdin)
-		if scanner.Scan() {
-			version = strings.TrimSpace(scanner.Text())
-		}
-		if version == "" {
-			fmt.Println("No version specified")
-			os.Exit(1)
+		if version, err = promptForVersion(); err != nil {
+			return nil, err
 		}
 	}
 
 	if version != "" {
 		if !isValidVersion(version) {
-			fmt.Printf("Invalid version format: %s\n", version)
-			os.Exit(1)
+			return nil, fmt.Errorf("invalid version format: %q (expected e.g. 26.2, 26.2.1 or 1.21.4)", version)
 		}
-
-		config = &Config{
-			Version: version,
-			Memory:  "2G",
-			Port:    25565,
+		if config == nil {
+			config = defaultConfig()
 		}
-
+		// Only the version changes, so hand-tuned memory and port settings in
+		// an existing mc.yml survive `mc <version>`.
+		config.Version = version
+		if err := config.normalize(); err != nil {
+			return nil, err
+		}
 		if err := saveConfig(config); err != nil {
-			fmt.Printf("Error saving config: %v\n", err)
-			os.Exit(1)
+			return nil, fmt.Errorf("saving %s: %w", configFile, err)
 		}
-	} else if exists {
-		versions := getVersionsFromJars()
-		if len(versions) > 1 {
-			selected, err := selectVersion(versions)
-			if err != nil {
-				fmt.Printf("Error selecting version: %v\n", err)
-				os.Exit(1)
-			}
-			config.Version = selected
-		}
+		return config, nil
 	}
 
-	jarPath := fmt.Sprintf("paper-%s.jar", config.Version)
-
-	if _, err := os.Stat(jarPath); os.IsNotExist(err) {
-		fmt.Printf("Downloading Paper %s...\n", config.Version)
-		if err := downloadPaper(config.Version, jarPath); err != nil {
-			fmt.Printf("Error downloading Paper: %v\n", err)
-			os.Exit(1)
-		}
+	if err := config.normalize(); err != nil {
+		return nil, err
 	}
 
-	// Prepare server.properties based on flags (offline mode and port)
-	if offlineMode {
-		if err := setServerProperty("online-mode", "false"); err != nil {
-			fmt.Printf("Warning: failed to set online-mode=false: %v\n", err)
+	if versions := getVersionsFromJars(); len(versions) > 1 {
+		selected, err := selectVersion(versions)
+		if err != nil {
+			return nil, err
 		}
+		config.Version = selected
 	}
-	if config != nil && config.Port != 0 {
-		if err := setServerProperty("server-port", strconv.Itoa(config.Port)); err != nil {
-			fmt.Printf("Warning: failed to set server-port: %v\n", err)
-		}
-	}
-
-	fmt.Printf("Starting Minecraft server %s...\n", config.Version)
-	if err := runServer(jarPath, config.Memory); err != nil {
-		fmt.Printf("Error running server: %v\n", err)
-		os.Exit(1)
-	}
+	return config, nil
 }
 
-// parseArgs parses flags: --temp, --offline/--offlinemode, and preserves positional args (like version).
-// It also handles legacy commands: "test" and app version flags.
-func parseArgs(args []string) (tempMode bool, offlineMode bool, positionals []string, handled bool) {
-	for _, a := range args {
-		switch a {
-		case "test":
-			testJavaSetup()
-			return false, false, nil, true
-		case "version", "--version", "-v":
-			fmt.Printf("mc version %s\n", Version)
-			return false, false, nil, true
-		case "--temp":
-			tempMode = true
-		case "--offline", "--offlinemode":
-			offlineMode = true
-		default:
-			if strings.HasPrefix(a, "-") {
-				// Unknown flag, ignore for now to keep behavior simple
-				continue
-			}
-			positionals = append(positionals, a)
-		}
+func promptForVersion() (string, error) {
+	fmt.Printf("No %s found. Enter Minecraft version (e.g., 26.2 or 1.21.4): ", configFile)
+
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		return "", errAborted
 	}
-	return
+	version := strings.TrimSpace(scanner.Text())
+	if version == "" {
+		return "", errors.New("no version specified")
+	}
+	return version, nil
 }
 
-// useTempWorkdir creates a temporary directory under /tmp and chdirs into it. Returns a cleanup function.
-func useTempWorkdir() (func(), error) {
-	tmpDir, err := os.MkdirTemp("/tmp", "mc-*")
+// printAvailableVersions lists what Paper currently publishes, grouped by
+// version family and newest first.
+func printAvailableVersions(out io.Writer) error {
+	families, byFamily, err := availableVersions()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	cwd, _ := os.Getwd()
-	if err := os.Chdir(tmpDir); err != nil {
-		return nil, err
-	}
-	cleanup := func() {
-		// best-effort: go back and remove temp dir
-		_ = os.Chdir(cwd)
-		_ = os.RemoveAll(tmpDir)
-	}
-	fmt.Printf("Using temporary workdir: %s\n", tmpDir)
-	return cleanup, nil
-}
 
-func validateJava() error {
-	cmd := exec.Command("java", "-version")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("java not found in PATH, please install Java")
+	fmt.Fprintln(out, "Available Paper versions:")
+	for _, family := range families {
+		fmt.Fprintf(out, "  %-6s %s\n", family, strings.Join(byFamily[family], ", "))
 	}
 	return nil
 }
 
-func loadConfig() (*Config, bool, error) {
-	data, err := os.ReadFile("mc.yml")
-	if os.IsNotExist(err) {
-		return nil, false, nil
-	}
+// useTempWorkdir creates a temporary directory, chdirs into it, and returns a
+// cleanup function that returns to the original directory and removes it.
+func useTempWorkdir() (func(), error) {
+	cwd, err := os.Getwd()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, false, err
-	}
-
-	return &config, true, nil
-}
-
-func saveConfig(config *Config) error {
-	data, err := yaml.Marshal(config)
+	// os.MkdirTemp with an empty dir honours TMPDIR and works on Windows,
+	// unlike a hardcoded /tmp.
+	tmpDir, err := os.MkdirTemp("", "mc-*")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile("mc.yml", data, 0644)
-}
-
-func isValidVersion(version string) bool {
-	pattern := `^\d+\.\d+(\.\d+)?$`
-	matched, _ := regexp.MatchString(pattern, version)
-	return matched
-}
-
-func getVersionsFromJars() []string {
-	files, err := filepath.Glob("paper-*.jar")
-	if err != nil {
-		return []string{}
+	if err := os.Chdir(tmpDir); err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, err
 	}
 
-	versions := make([]string, 0, len(files))
-	for _, file := range files {
-		if strings.HasPrefix(file, "paper-") && strings.HasSuffix(file, ".jar") {
-			version := strings.TrimPrefix(file, "paper-")
-			version = strings.TrimSuffix(version, ".jar")
-			versions = append(versions, version)
-		}
-	}
-
-	sort.Slice(versions, func(i, j int) bool {
-		return compareVersions(versions[i], versions[j]) > 0
-	})
-
-	return versions
-}
-
-func compareVersions(v1, v2 string) int {
-	parts1 := strings.Split(v1, ".")
-	parts2 := strings.Split(v2, ".")
-
-	maxLen := len(parts1)
-	if len(parts2) > maxLen {
-		maxLen = len(parts2)
-	}
-
-	for i := 0; i < maxLen; i++ {
-		var p1, p2 int
-		if i < len(parts1) {
-			p1, _ = strconv.Atoi(parts1[i])
-		}
-		if i < len(parts2) {
-			p2, _ = strconv.Atoi(parts2[i])
-		}
-
-		if p1 > p2 {
-			return 1
-		} else if p1 < p2 {
-			return -1
-		}
-	}
-	return 0
-}
-
-func selectVersion(versions []string) (string, error) {
-	items := make([]list.Item, len(versions))
-	for i, version := range versions {
-		items[i] = item{title: version, desc: fmt.Sprintf("Paper %s", version)}
-	}
-
-	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "Select Minecraft Version"
-	l.SetShowStatusBar(false)
-	l.SetFilteringEnabled(false)
-	l.Styles.Title = lipgloss.NewStyle().MarginLeft(2)
-
-	m := model{list: l}
-
-	p := tea.NewProgram(m)
-	finalModel, err := p.Run()
-	if err != nil {
-		return "", err
-	}
-
-	if finalModel.(model).quitting {
-		os.Exit(0)
-	}
-
-	return finalModel.(model).choice, nil
-}
-
-func downloadPaper(version, jarPath string) error {
-	url := fmt.Sprintf("https://api.papermc.io/v2/projects/paper/versions/%s/builds", version)
-
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("version %s not found", version)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	buildNumber := extractLatestBuild(string(body))
-	if buildNumber == "" {
-		return fmt.Errorf("no builds found for version %s", version)
-	}
-
-	downloadURL := fmt.Sprintf("https://api.papermc.io/v2/projects/paper/versions/%s/builds/%s/downloads/paper-%s-%s.jar",
-		version, buildNumber, version, buildNumber)
-
-	resp, err = http.Get(downloadURL)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("download failed with status: %d", resp.StatusCode)
-	}
-
-	file, err := os.Create(jarPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	_, err = io.Copy(file, resp.Body)
-	return err
-}
-
-func extractLatestBuild(jsonBody string) string {
-	pattern := `"build":(\d+)`
-	re := regexp.MustCompile(pattern)
-	matches := re.FindAllStringSubmatch(jsonBody, -1)
-
-	if len(matches) == 0 {
-		return ""
-	}
-
-	latestBuild := 0
-	for _, match := range matches {
-		if len(match) > 1 {
-			if build, err := strconv.Atoi(match[1]); err == nil && build > latestBuild {
-				latestBuild = build
-			}
-		}
-	}
-
-	if latestBuild > 0 {
-		return strconv.Itoa(latestBuild)
-	}
-	return ""
-}
-
-// setServerProperty ensures server.properties exists with a given key=value, updating if already present.
-func setServerProperty(key, value string) error {
-	const propsFile = "server.properties"
-	var lines []string
-	if b, err := os.ReadFile(propsFile); err == nil {
-		// load existing
-		lines = strings.Split(string(b), "\n")
-	} else if os.IsNotExist(err) {
-		lines = []string{}
-	} else if err != nil {
-		return err
-	}
-
-	// find and update or append
-	found := false
-	for i, ln := range lines {
-		if strings.HasPrefix(ln, key+"=") || strings.HasPrefix(ln, "#"+key+"=") {
-			lines[i] = fmt.Sprintf("%s=%s", key, value)
-			found = true
-			break
-		}
-	}
-	if !found {
-		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
-	}
-
-	content := strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
-	return os.WriteFile(propsFile, []byte(content), 0644)
-}
-
-type lockedWriteCloser struct {
-	w  io.WriteCloser
-	mu sync.Mutex
-}
-
-func (l *lockedWriteCloser) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.w.Write(p)
-}
-
-func (l *lockedWriteCloser) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.w.Close()
-}
-
-func runServer(jarPath, memory string) error {
-	// Auto-accept EULA
-	if err := acceptEula(); err != nil {
-		return fmt.Errorf("failed to accept EULA: %v", err)
-	}
-
-	// Build command with signal-aware handling and truly transparent stdio proxying
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "java", fmt.Sprintf("-Xmx%s", memory), "-jar", jarPath, "nogui")
-
-	// Place the child in its own process group (POSIX) or leave default on Windows
-	setCmdSysProcAttr(cmd)
-
-	// Wire stdout/stderr directly
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// We need a pipe for stdin, so we can both forward user's input and inject "stop" if needed
-	stdinPipe, err := cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-	stdin := &lockedWriteCloser{w: stdinPipe}
-
-	// Forward user's keystrokes to server stdin via the locked writer
-	userInputDone := make(chan struct{})
-	go func() {
-		defer close(userInputDone)
-		_, _ = io.Copy(stdin, os.Stdin)
-		// When user's stdin closes (e.g., ctrl-d), close child's stdin to signal EOF
-		_ = stdin.Close()
-	}()
-
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	// Signal handling: gracefully stop, then escalate
-	sigCh := make(chan os.Signal, 4)
-	// Listen for interrupts and termination signals (SIGTERM on POSIX)
-	signal.Notify(sigCh, os.Interrupt)
-	defer signal.Stop(sigCh)
-
-	stopping := false
-	interrupts := 0
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	escalateOnce := make(chan struct{}, 1)
-	escalateOnce <- struct{}{}
-
-	for {
-		select {
-		case err := <-done:
-			// Child finished
-			return err
-		case sig := <-sigCh:
-			interrupts++
-			if !stopping {
-				stopping = true
-				// First signal: try graceful stop via console command
-				_, _ = stdin.Write([]byte("stop\n"))
-				// After grace period, escalate only once
-				select {
-				case <-escalateOnce:
-					go func() {
-						t := time.NewTimer(10 * time.Second)
-						<-t.C
-						escalateTerminate(cmd)
-					}()
-				default:
-				}
-				continue
-			}
-			// Already stopping: forward the signal to the child
-			forwardSignal(cmd, sig)
-			if interrupts >= 3 {
-				// Hard kill on repeated interrupts
-				forceKill(cmd)
-			}
-		}
-	}
-}
-
-func acceptEula() error {
-	eulaContent := "# Minecraft EULA\n# Auto-accepted by mc utility\neula=true\n"
-	return os.WriteFile("eula.txt", []byte(eulaContent), 0644)
-}
-
-func testJavaSetup() {
-	fmt.Println("Testing Java setup...")
-
-	cmd := exec.Command("java", "-version")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("❌ Java not found: %v\n", err)
-		fmt.Println("Please install Java and add it to your PATH")
-		os.Exit(1)
-	}
-
-	fmt.Printf("✅ Java is installed:\n%s", output)
-
-	cmd = exec.Command("java", "-Xmx1G", "-version")
-	err = cmd.Run()
-	if err != nil {
-		fmt.Printf("❌ Java memory allocation test failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("✅ Java memory allocation works correctly")
-	fmt.Println("✅ Java setup is valid for running Minecraft servers")
+	fmt.Printf("Using temporary workdir: %s\n", tmpDir)
+	return func() {
+		_ = os.Chdir(cwd)
+		_ = os.RemoveAll(tmpDir)
+	}, nil
 }
